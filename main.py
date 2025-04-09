@@ -2,6 +2,7 @@ import xarray as xr
 import numpy as np
 import pandas as pd
 import  geopandas as gpd
+from affine import Affine
 from datetime import datetime, timedelta
 import aiohttp
 import asyncio
@@ -61,11 +62,11 @@ async def baixar_grib_hoje():
 
 
     # Baixar somente se não existir
-    if not os.path.exists(filename):
-        semaphore = asyncio.Semaphore(1)
-        await download_file(url, filename, semaphore)
-    else:
-        print("📂 Arquivo já existe localmente.")
+    # if not os.path.exists(filename):
+    semaphore = asyncio.Semaphore(1)
+    await download_file(url, filename, semaphore)
+    # else:
+        # print("📂 Arquivo já existe localmente.")
 
     return filename, hoje
 
@@ -94,75 +95,103 @@ def saveParameter(city_id, dsc):
     cursor.execute(sql)
 
     conn.commit()
+def createFile(ds):
+    res = 0.1
 
+    # Define o transform com base no canto superior esquerdo
+    transform = from_origin(
+        west=ds.longitude.min().item() - res / 2,
+        north=ds.latitude.max().item() + res / 2,
+        xsize=res,
+        ysize=res
+    )
 
-DF_CITIES = getCities()
-PARAMETERS = getParameters()
+    # Extrair grade do raster
+    latitudes = ds.latitude.values
+    longitudes = ds.longitude.values
+    lon_grid, lat_grid = np.meshgrid(longitudes, latitudes)
+    coords = np.column_stack((lon_grid.ravel(), lat_grid.ravel()))
 
-# print(PARAMETERS['values'].apply(pd.read_json))
+    # Criar árvore de busca para coordenadas
+    tree = cKDTree(coords)
 
+    # Inicializar lista de resultados
+    resultados = []
 
+    data = pd.to_datetime(str(ds.time.values)).date() if "time" in ds.coords else None
 
+    array = ds.prec.values.astype(np.float32)
 
-filename_hoje, data_hoje = asyncio.run(baixar_grib_hoje())
-print(filename_hoje)
-ds =  xr.open_dataset(filename_hoje)
-municipios_sp = gpd.read_file('zonal/municipios_sp.shp', encoding='utf-8')
-municipios_sp = municipios_sp.to_crs("EPSG:4326")
-# Define resolução (assume 0.1° que é típico no MERGE, ajuste se necessário)
-res = 0.1
+    import os
+    import tempfile
 
-# Define o transform com base no canto superior esquerdo
-transform = from_origin(
-    west=ds.longitude.min().item() - res / 2,
-    north=ds.latitude.max().item() + res / 2,
-    xsize=res,
-    ysize=res
-)
+    # Defina o caminho para salvar o arquivo temporário manualmente
+    tmp_path = os.path.join(os.getcwd(), "temp_raster.tif")
 
-# Extrair grade do raster
-latitudes = ds.latitude.values
-longitudes = ds.longitude.values
-lon_grid, lat_grid = np.meshgrid(longitudes, latitudes)
-coords = np.column_stack((lon_grid.ravel(), lat_grid.ravel()))
+    with rasterio.open(
+        tmp_path,
+        "w",
+        driver="GTiff",
+        height=array.shape[0],
+        width=array.shape[1],
+        count=1,
+        dtype="float32",
+        crs="EPSG:4326",
+        transform=transform,
+        nodata=np.nan
+    ) as dst:
+        dst.write(array, 1)
 
-# Criar árvore de busca para coordenadas
-tree = cKDTree(coords)
+    
 
-# Inicializar lista de resultados
-resultados = []
+    return resultados
 
-data = pd.to_datetime(str(ds.time.values)).date() if "time" in ds.coords else None
+def createFileAux(ds_total):
+    ds_total['longitude'] = (ds_total['longitude'] + 180) % 360 - 180
+    ds_total = ds_total.sortby('longitude')
 
-array = ds.prec.values.astype(np.float32)
+    lats = ds_total['latitude'][::-1].values
+    lons = ds_total['longitude'].values
 
-import os
-import tempfile
+    res_x = (lons.max() - lons.min()) / (len(lons) - 1)
+    res_y = (lats.max() - lats.min()) / (len(lats) - 1)
+    transform = Affine.translation(lons.min() , lats.max()) * Affine.scale(res_x, -res_y)
+    
+    output_tiff = os.path.join('', f"current.tiff")
 
-# Defina o caminho para salvar o arquivo temporário manualmente
-tmp_path = os.path.join(os.getcwd(), "temp_raster.tif")
+    var_name = list(ds_total.data_vars)[0]  # Pega o nome da primeira variável
+    data = ds_total[var_name].values[::-1]  # Obtém os valores da variável
+    # ds_total.to_netcdf(output_nc)
+    with rasterio.open(output_tiff, 'w', driver='GTiff',
+                    height=len(lats), width=len(lons),
+                    count=1, dtype=data.dtype,
+                    crs='EPSG:4326', transform=transform) as dst:
+        dst.write(data, 1)
 
-with rasterio.open(
-    tmp_path,
-    "w",
-    driver="GTiff",
-    height=array.shape[0],
-    width=array.shape[1],
-    count=1,
-    dtype="float32",
-    crs="EPSG:4326",
-    transform=transform,
-    nodata=np.nan
-) as dst:
-    dst.write(array, 1)
+def calculateZonal(ds):
+    municipios_sp = gpd.read_file('zonal/municipios_sp.shp', encoding='utf-8')
+    municipios_sp = municipios_sp.to_crs("EPSG:4326")
 
-# Depois você pode excluir esse arquivo manualmente se quiser
+    latitudes = ds.latitude.values
+    longitudes = ds.longitude.values
+    lon_grid, lat_grid = np.meshgrid(longitudes, latitudes)
+    coords = np.column_stack((lon_grid.ravel(), lat_grid.ravel()))
+
+    # Criar árvore de busca para coordenadas
+    tree = cKDTree(coords)
+
+    # Inicializar lista de resultados
+    resultados = []
+
+    data = pd.to_datetime(str(ds.time.values)).date() if "time" in ds.coords else None
+
+    array = ds.prec.values.astype(np.float32)
 
     for idx, row in municipios_sp.iterrows():
         # Estatística zonal
         stat = zonal_stats(
             [row['geometry']],
-            "temp_raster.tif",
+            "current.tiff",
             stats=["max"],
             nodata=np.nan
         )[0]["max"]
@@ -178,6 +207,35 @@ with rasterio.open(
             "data": data,
             "prec_max": stat
         })
+
+    return resultados
+
+pd.set_option('display.max_rows', None)
+print('buscando cidades SIBH')
+DF_CITIES = getCities()
+print('buscando parametros SIBH')
+PARAMETERS = getParameters()
+
+# print(PARAMETERS['values'].apply(pd.read_json))
+
+
+
+print('baixando raster de chuva')
+filename_hoje, data_hoje = asyncio.run(baixar_grib_hoje())
+print('download finalizado com sucesso')
+ds =  xr.open_dataset(filename_hoje)
+
+# Define resolução (assume 0.1° que é típico no MERGE, ajuste se necessário)
+
+# resultados = createFile(ds)
+
+createFileAux(ds)
+
+resultados = calculateZonal(ds)
+
+
+
+# Depois você pode excluir esse arquivo manualmente se quiser
 
 
 # Converter para DataFrame
@@ -215,6 +273,8 @@ df_dias_secos = pd.DataFrame(df_list)
 df_prec_max["cd_mun"] = df_prec_max["cd_mun"].astype(str)
 df_atualizado = pd.merge(df_dias_secos, df_prec_max[['cd_mun', 'prec_max']], on='cd_mun', how='left')
 
+# print(df_atualizado)
+
 # Aplicar as regras para atualização
 def atualizar_dias_secos(row):
     if row['prec_max'] < 1:
@@ -233,14 +293,16 @@ df_dias_secos_new = df_atualizado[['cd_mun',  'DSC']].copy()
 
 cds = df_dias_secos_new['cd_mun'].unique()
 
+
+
 # ibge = cds[0]
 # print(first)
-# for ibge in cds:
-#     dsc = df_dias_secos_new[df_dias_secos_new['cd_mun'] == ibge].iloc[0]['DSC']
-#     id = DF_CITIES[DF_CITIES['cod_ibge'] == ibge].iloc[0]['id']
-#     # print(id, ibge)
-#     print(f'salvando {ibge} {id} {dsc}')
-#     saveParameter(id, dsc)
+for ibge in cds:
+    dsc = df_dias_secos_new[df_dias_secos_new['cd_mun'] == ibge].iloc[0]['DSC']
+    id = DF_CITIES[DF_CITIES['cod_ibge'] == ibge].iloc[0]['id']
+    # print(id, ibge)
+    print(f'salvando {ibge} {id} {dsc}')
+    saveParameter(id, dsc)
 
 # df_dias_secos_new.to_csv(f'ds_dsc{ano}{mes:02}{dia:02}.csv', index=False)
 
