@@ -55,7 +55,7 @@ async def download_file(url, filename, semaphore):
         print(f"❌ Erro inesperado em {url}: {e}")
 
 async def baixar_grib_hoje():
-    hoje = datetime.now() - timedelta(days=1)
+    hoje = datetime.now()
     ano, mes, dia = hoje.year, hoje.month, hoje.day
     url = f"https://ftp.cptec.inpe.br/modelos/tempo/MERGE/GPM/DAILY/{ano}/{mes:02}/MERGE_CPTEC_{ano}{mes:02}{dia:02}.grib2"
     filename = 'grib_dia.grib2'
